@@ -1,0 +1,140 @@
+x-spark-common: &spark-common
+  image: spark:3.5.8-python3
+  environment: &spark-env
+    MYSQL_HOST: mysql
+    MYSQL_PORT: "3306"
+    MYSQL_DATABASE: classicmodels
+    MYSQL_USER: etl
+    MYSQL_PASSWORD: etl
+    ICEBERG_CATALOG: local
+    ICEBERG_WAREHOUSE: s3a://warehouse/iceberg
+    ICEBERG_BRONZE_NAMESPACE: bronze
+    ICEBERG_STAR_NAMESPACE: star_schema
+    SPARK_PACKAGES: org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,com.mysql:mysql-connector-j:8.4.0,org.apache.hadoop:hadoop-aws:3.3.4
+    SPARK_SUBMIT_CONF: >-
+      --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+      --conf spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog
+      --conf spark.sql.catalog.local.type=hadoop
+      --conf spark.sql.catalog.local.warehouse=s3a://warehouse/iceberg
+      --conf spark.sql.defaultCatalog=local
+      --conf spark.jars.ivy=/tmp/.ivy2
+      --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+      --conf spark.hadoop.fs.s3a.access.key=minioadmin
+      --conf spark.hadoop.fs.s3a.secret.key=minioadmin
+      --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+  volumes:
+    - ./etl/jobs:/opt/spark/jobs:ro
+  restart: "no"
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: classicmodels-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: classicmodels
+      MYSQL_USER: etl
+      MYSQL_PASSWORD: etl
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: classicmodels-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+
+  create-bucket:
+    image: minio/mc:latest
+    container_name: classicmodels-create-bucket
+    depends_on:
+      - minio
+    entrypoint: /bin/sh
+    command: >
+      -c "
+      until mc alias set lakehouse http://minio:9000 minioadmin minioadmin; do
+        sleep 2;
+      done;
+      mc mb --ignore-existing lakehouse/warehouse
+      "
+    restart: "no"
+
+  etl:
+    <<: *spark-common
+    container_name: classicmodels-etl
+    depends_on:
+      mysql:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+    command: >
+      bash -lc "
+      /opt/spark/bin/spark-submit
+      --packages $${SPARK_PACKAGES}
+      $${SPARK_SUBMIT_CONF}
+      /opt/spark/jobs/build_star_schema.py
+      "
+
+  sync:
+    <<: *spark-common
+    container_name: classicmodels-sync
+    profiles:
+      - scheduler
+    depends_on:
+      mysql:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+    environment:
+      <<: *spark-env
+      SYNC_INTERVAL_SECONDS: "${SYNC_INTERVAL_SECONDS:-300}"
+    command: >
+      bash -lc "
+      while true; do
+        date;
+        /opt/spark/bin/spark-submit
+        --packages $${SPARK_PACKAGES}
+        $${SPARK_SUBMIT_CONF}
+        /opt/spark/jobs/build_star_schema.py
+        || echo 'ETL sync failed';
+        sleep $${SYNC_INTERVAL_SECONDS};
+      done
+      "
+
+  query:
+    <<: *spark-common
+    container_name: classicmodels-query
+    profiles:
+      - tools
+    depends_on:
+      create-bucket:
+        condition: service_completed_successfully
+    command: >
+      bash -lc "
+      /opt/spark/bin/spark-submit
+      --packages $${SPARK_PACKAGES}
+      $${SPARK_SUBMIT_CONF}
+      /opt/spark/jobs/query_star_schema.py
+      "
+
+volumes:
+  mysql_data:
+  minio_data:
