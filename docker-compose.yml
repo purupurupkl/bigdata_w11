@@ -6,28 +6,38 @@ x-spark-common: &spark-common
     MYSQL_DATABASE: classicmodels
     MYSQL_USER: etl
     MYSQL_PASSWORD: etl
-    ICEBERG_CATALOG: local
-    ICEBERG_WAREHOUSE: s3a://warehouse/iceberg
-    ICEBERG_BRONZE_NAMESPACE: bronze
-    ICEBERG_STAR_NAMESPACE: star_schema
-    SPARK_PACKAGES: org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,com.mysql:mysql-connector-j:8.4.0,org.apache.hadoop:hadoop-aws:3.3.4
-    SPARK_SUBMIT_CONF: >-
-      --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
-      --conf spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog
-      --conf spark.sql.catalog.local.type=hadoop
-      --conf spark.sql.catalog.local.warehouse=s3a://warehouse/iceberg
-      --conf spark.sql.defaultCatalog=local
-      --conf spark.jars.ivy=/tmp/.ivy2
-      --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
-      --conf spark.hadoop.fs.s3a.access.key=minioadmin
-      --conf spark.hadoop.fs.s3a.secret.key=minioadmin
-      --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
-      --conf spark.hadoop.fs.s3a.path.style.access=true
-      --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
-      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+    POSTGRES_DW_HOST: postgres-dw
+    POSTGRES_DW_PORT: "5432"
+    POSTGRES_DW_DB: star_schema_dw
+    POSTGRES_DW_USER: warehouse_user
+    POSTGRES_DW_PASSWORD: warehouse_password
+    SPARK_PACKAGES: com.mysql:mysql-connector-j:8.4.0,org.postgresql:postgresql:42.7.3
+    SPARK_SUBMIT_CONF: "--conf spark.jars.ivy=/tmp/.ivy2"
   volumes:
     - ./etl/jobs:/opt/spark/jobs:ro
   restart: "no"
+
+x-airflow-common: &airflow-common
+  build: .
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+    AIRFLOW__WEBSERVER__SECRET_KEY: classicmodels-lakehouse-demo
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+    DOCKER_HOST: unix:///var/run/docker.sock
+    AIRFLOW_HOST_PROJECT_ROOT: "${PWD:-/home/huy/Desktop/bigdata_code/star_schema}"
+  user: "0:0"
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags:ro
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./etl/jobs:/opt/spark/jobs:ro
+    - /var/run/docker.sock:/var/run/docker.sock
+  depends_on:
+    airflow-postgres:
+      condition: service_healthy
 
 services:
   mysql:
@@ -49,33 +59,23 @@ services:
       timeout: 5s
       retries: 20
 
-  minio:
-    image: minio/minio:latest
-    container_name: classicmodels-minio
+  # PostgreSQL as Data Warehouse
+  postgres-dw:
+    image: postgres:16
+    container_name: classicmodels-dw
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      POSTGRES_USER: warehouse_user
+      POSTGRES_PASSWORD: warehouse_password
+      POSTGRES_DB: star_schema_dw
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "5433:5432"
     volumes:
-      - minio_data:/data
-    command: server /data --console-address ":9001"
-
-  create-bucket:
-    image: minio/mc:latest
-    container_name: classicmodels-create-bucket
-    depends_on:
-      - minio
-    entrypoint: /bin/sh
-    command: >
-      -c "
-      until mc alias set lakehouse http://minio:9000 minioadmin minioadmin; do
-        sleep 2;
-      done;
-      mc mb --ignore-existing lakehouse/warehouse
-      "
-    restart: "no"
+      - dw_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U warehouse_user -d star_schema_dw"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   etl:
     <<: *spark-common
@@ -83,8 +83,8 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-      create-bucket:
-        condition: service_completed_successfully
+      postgres-dw:
+        condition: service_healthy
     command: >
       bash -lc "
       /opt/spark/bin/spark-submit
@@ -101,8 +101,8 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-      create-bucket:
-        condition: service_completed_successfully
+      postgres-dw:
+        condition: service_healthy
     environment:
       <<: *spark-env
       SYNC_INTERVAL_SECONDS: "${SYNC_INTERVAL_SECONDS:-300}"
@@ -125,8 +125,8 @@ services:
     profiles:
       - tools
     depends_on:
-      create-bucket:
-        condition: service_completed_successfully
+      postgres-dw:
+        condition: service_healthy
     command: >
       bash -lc "
       /opt/spark/bin/spark-submit
@@ -135,6 +135,68 @@ services:
       /opt/spark/jobs/query_star_schema.py
       "
 
+  airflow-postgres:
+    image: postgres:16
+    container_name: classicmodels-airflow-postgres
+    profiles:
+      - airflow
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: classicmodels-airflow-init
+    profiles:
+      - airflow
+    entrypoint: /bin/bash
+    command: >
+      -c "airflow db migrate && (airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || true)"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: classicmodels-airflow-webserver
+    profiles:
+      - airflow
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      mysql:
+        condition: service_healthy
+      postgres-dw:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    command: webserver
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: classicmodels-airflow-scheduler
+    profiles:
+      - airflow
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      mysql:
+        condition: service_healthy
+      postgres-dw:
+        condition: service_healthy
+    command: scheduler
+
 volumes:
   mysql_data:
-  minio_data:
+  dw_data:
+  airflow_postgres_data:

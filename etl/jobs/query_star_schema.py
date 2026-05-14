@@ -7,28 +7,33 @@ def env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-catalog = env("ICEBERG_CATALOG", "local")
-warehouse = env("ICEBERG_WAREHOUSE", "s3a://warehouse/iceberg")
-star_namespace = env("ICEBERG_STAR_NAMESPACE", "star_schema")
+# PostgreSQL Warehouse Configuration
+pg_host = env("POSTGRES_DW_HOST", "postgres-dw")
+pg_port = env("POSTGRES_DW_PORT", "5432")
+pg_database = env("POSTGRES_DW_DB", "star_schema_dw")
+pg_user = env("POSTGRES_DW_USER", "warehouse_user")
+pg_password = env("POSTGRES_DW_PASSWORD", "warehouse_password")
+pg_url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_database}"
 
 spark = (
     SparkSession.builder.appName("query-classicmodels-star-schema")
-    .config(
-        "spark.sql.extensions",
-        "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-    )
-    .config(f"spark.sql.catalog.{catalog}", "org.apache.iceberg.spark.SparkCatalog")
-    .config(f"spark.sql.catalog.{catalog}.type", "hadoop")
-    .config(f"spark.sql.catalog.{catalog}.warehouse", warehouse)
-    .config("spark.sql.defaultCatalog", catalog)
     .getOrCreate()
 )
 
-star = f"{catalog}.{star_namespace}"
+
+def jdbc_read_postgres(query: str) -> str:
+    """Read from PostgreSQL using JDBC"""
+    properties = {
+        "url": pg_url,
+        "driver": "org.postgresql.Driver",
+        "user": pg_user,
+        "password": pg_password,
+    }
+    return spark.read.format("jdbc").option("query", query).options(**properties).load()
+
 
 print("Revenue by order month, customer country, and product line")
-spark.sql(
-    f"""
+result = jdbc_read_postgres("""
     SELECT
       d.calendar_year,
       d.calendar_month,
@@ -37,34 +42,32 @@ spark.sql(
       sum(f.quantity_ordered) AS units_sold,
       CAST(sum(f.gross_sales_amount) AS DECIMAL(12, 2)) AS gross_revenue,
       CAST(sum(f.margin_amount) AS DECIMAL(12, 2)) AS margin
-    FROM {star}.fact_order_sales f
-    JOIN {star}.dim_date d
+    FROM star_schema.fact_order_sales f
+    JOIN star_schema.dim_date d
       ON f.order_date_key = d.date_key
-    JOIN {star}.dim_customer c
+    JOIN star_schema.dim_customer c
       ON f.customer_key = c.customer_key
-    JOIN {star}.dim_product p
+    JOIN star_schema.dim_product p
       ON f.product_key = p.product_key
     GROUP BY d.calendar_year, d.calendar_month, c.country, p.product_line
     ORDER BY d.calendar_year, d.calendar_month, c.country, p.product_line
-    """
-).show(truncate=False)
+""")
+
+result.show(truncate=False)
 
 print("Top customers by gross revenue")
-spark.sql(
-    f"""
+result2 = jdbc_read_postgres("""
     SELECT
       c.customer_name,
       c.country,
       CAST(sum(f.gross_sales_amount) AS DECIMAL(12, 2)) AS gross_revenue
-    FROM {star}.fact_order_sales f
-    JOIN {star}.dim_customer c
+    FROM star_schema.fact_order_sales f
+    JOIN star_schema.dim_customer c
       ON f.customer_key = c.customer_key
     GROUP BY c.customer_name, c.country
     ORDER BY gross_revenue DESC
-    """
-).show(truncate=False)
+""")
 
-print("Iceberg star schema tables")
-spark.sql(f"SHOW TABLES IN {star}").show(truncate=False)
+result2.show(truncate=False)
 
 spark.stop()

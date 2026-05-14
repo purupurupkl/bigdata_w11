@@ -1,6 +1,5 @@
 # Classicmodels MySQL to Iceberg Star Schema
 
-Project này mock một pipeline Lakehouse đúng theo assignment:
 
 ```text
 MySQL classicmodels
@@ -9,7 +8,7 @@ MySQL classicmodels
   -> Iceberg star schema tables trên MinIO
 ```
 
-Stack gồm:
+Stack gồm: 
 
 - `mysql`: source RDBMS, seed database `classicmodels`.
 - `minio`: object storage để lưu Iceberg warehouse.
@@ -52,7 +51,7 @@ Iceberg warehouse nằm trong bucket/path:
 s3a://warehouse/iceberg
 ```
 
-## Chạy Đồng Bộ Định Kỳ
+## Đồng bộ:
 
 Chạy service sync:
 
@@ -60,46 +59,63 @@ Chạy service sync:
 docker compose --profile scheduler up sync
 ```
 
-Mặc định mỗi 300 giây service này chạy lại Spark ETL một lần. Có thể đổi interval:
+## Airflow Orchestration
+
+Bai tap moi yeu cau scheduling, orchestration va monitoring bang Airflow hoac Dagster. Project nay dung Airflow de dieu phoi pipeline Spark ETL da co.
+
+Chay Airflow:
 
 ```bash
-SYNC_INTERVAL_SECONDS=60 docker compose --profile scheduler up sync
+docker compose --profile airflow up airflow-webserver airflow-scheduler
 ```
 
-## Test Source Thay Đổi
+Mo Airflow UI:
 
-Sau khi đã chạy ETL lần đầu, áp dụng script thay đổi dữ liệu nguồn:
-
-```bash
-docker exec -i classicmodels-mysql mysql -uroot -proot classicmodels < mysql/examples/01_make_source_changes.sql
+```text
+http://localhost:8080
+user: admin
+password: admin
 ```
 
-Sau đó chạy lại ETL một lượt:
+DAG:
 
-```bash
-docker compose run --rm etl
+```text
+classicmodels_mysql_to_iceberg_star_schema
 ```
 
-Hoặc để service `sync` tự bắt thay đổi ở lần chạy định kỳ tiếp theo.
+Workflow trong DAG:
 
-Query lại star schema:
-
-```bash
-docker compose run --rm query
+```text
+start
+  -> check_mysql_ready
+  -> check_minio_ready
+  -> run_spark_etl
+  -> validate_star_schema
+  -> end
 ```
 
-## Các Bảng Nguồn Classicmodels
+Y nghia cac task:
 
-MySQL source có các bảng classicmodels chính:
+- `check_mysql_ready`: kiem tra MySQL source da san sang.
+- `check_minio_ready`: kiem tra MinIO bucket `warehouse` da san sang.
+- `run_spark_etl`: chay Spark ETL, doc MySQL qua JDBC va ghi Iceberg tren MinIO.
+- `validate_star_schema`: chay Spark SQL query de kiem tra bang star schema doc duoc.
 
-- `offices`
-- `employees`
-- `customers`
-- `productlines`
-- `products`
-- `orders`
-- `orderdetails`
-- `payments`
+Scheduling:
+
+- DAG duoc lap lich moi 1 phut bang `schedule=timedelta(minutes=1)`.
+- `max_active_runs=1` de tranh nhieu lan ETL chay chong len nhau.
+
+Orchestration:
+
+- Airflow quan ly thu tu task.
+- Neu check MySQL/MinIO fail thi ETL khong chay.
+- Neu ETL fail thi validation query khong chay.
+
+Monitoring:
+
+- Airflow UI hien thi Graph, Grid, lich su lan chay, trang thai tung task va logs.
+- Nen screenshot Graph view, Grid view, task logs cua `run_spark_etl`, va task logs cua `validate_star_schema`.
 
 ## Bronze Layer
 
@@ -160,17 +176,23 @@ Các measure chính:
 
 `fact_payments` có grain là một payment/check của customer.
 
-## Cách Đồng Bộ Hoạt Động
+# Pipeline ETL (Python + Spark)
 
-Mỗi lượt ETL:
+- build_star_schema.py:
+  Dùng Spark đọc dữ liệu từ MySQL classicmodels qua JDBC.
+  Đồng bộ các bảng nguồn vào Iceberg bronze tables trên MinIO.
+  Tạo surrogate keys cho dimension/fact.
+  Chuyển dữ liệu từ mô hình OLTP sang Star Schema.
+  Ghi các bảng dimension và fact vào Iceberg warehouse trên MinIO.
 
-1. Đọc các bảng MySQL classicmodels qua JDBC.
-2. Tạo staging dataframe cho từng bảng.
-3. Tính `_row_hash` từ toàn bộ cột source.
-4. `MERGE INTO local.bronze.<table>` theo primary key.
-5. Dòng mới được insert.
-6. Dòng đổi dữ liệu được update.
-7. Dòng không còn trong MySQL được đánh dấu `_is_deleted = true`.
-8. Rebuild các bảng star schema từ bronze active rows.
+- query_star_schema.py:
+  Dùng Spark SQL kết nối đến Iceberg catalog.
+  Đọc các bảng Star Schema từ MinIO.
+  Chạy các truy vấn kiểm tra như doanh thu theo tháng/quốc gia/product line
+  và top customers theo gross revenue.
 
-Đây là cách phù hợp cho assignment và dataset nhỏ. Trong production lớn hơn, nên dùng `updated_at` hoặc CDC như Debezium thay vì đọc full snapshot mỗi kỳ.
+- sync service trong docker-compose.yml:
+  Chạy lại build_star_schema.py theo chu kỳ.
+  Mặc định mỗi 300 giây, có thể đổi thành 60 giây bằng SYNC_INTERVAL_SECONDS.
+  Mỗi lần chạy, pipeline đọc lại source MySQL, so sánh với bronze bằng primary key
+  và _row_hash, sau đó MERGE INTO Iceberg để insert/update/mark deleted rows.

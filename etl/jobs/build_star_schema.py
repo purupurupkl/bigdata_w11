@@ -2,8 +2,7 @@ import os
 from typing import Dict, List
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import coalesce, col, concat_ws, current_timestamp, lit, sha2
-from pyspark.sql.utils import AnalysisException
+from pyspark.sql.functions import current_timestamp
 
 
 SOURCE_TABLES: Dict[str, List[str]] = {
@@ -22,45 +21,29 @@ def env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-catalog = env("ICEBERG_CATALOG", "local")
-warehouse = env("ICEBERG_WAREHOUSE", "s3a://warehouse/iceberg")
-bronze_namespace = env("ICEBERG_BRONZE_NAMESPACE", "bronze")
-star_namespace = env("ICEBERG_STAR_NAMESPACE", "star_schema")
-
+# MySQL Source Configuration
 mysql_host = env("MYSQL_HOST", "mysql")
 mysql_port = env("MYSQL_PORT", "3306")
 mysql_database = env("MYSQL_DATABASE", "classicmodels")
 mysql_user = env("MYSQL_USER", "etl")
 mysql_password = env("MYSQL_PASSWORD", "etl")
 
+# PostgreSQL Warehouse Configuration
+pg_host = env("POSTGRES_DW_HOST", "postgres-dw")
+pg_port = env("POSTGRES_DW_PORT", "5432")
+pg_database = env("POSTGRES_DW_DB", "star_schema_dw")
+pg_user = env("POSTGRES_DW_USER", "warehouse_user")
+pg_password = env("POSTGRES_DW_PASSWORD", "warehouse_password")
+pg_url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_database}"
 
 spark = (
-    SparkSession.builder.appName("classicmodels-mysql-to-iceberg-star-schema")
-    .config(
-        "spark.sql.extensions",
-        "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-    )
-    .config(f"spark.sql.catalog.{catalog}", "org.apache.iceberg.spark.SparkCatalog")
-    .config(f"spark.sql.catalog.{catalog}.type", "hadoop")
-    .config(f"spark.sql.catalog.{catalog}.warehouse", warehouse)
-    .config("spark.sql.defaultCatalog", catalog)
+    SparkSession.builder.appName("classicmodels-mysql-to-postgres-star-schema")
     .getOrCreate()
 )
 
 
-def q(identifier: str) -> str:
-    return f"`{identifier}`"
-
-
-def table_name(namespace: str, table: str) -> str:
-    return f"{catalog}.{namespace}.{table}"
-
-
-def create_namespace(namespace: str) -> None:
-    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {catalog}.{namespace}")
-
-
-def jdbc_read(table: str) -> DataFrame:
+def jdbc_read_mysql(table: str) -> DataFrame:
+    """Read table from MySQL using JDBC"""
     url = (
         f"jdbc:mysql://{mysql_host}:{mysql_port}/{mysql_database}"
         "?useSSL=false&allowPublicKeyRetrieval=true"
@@ -76,233 +59,143 @@ def jdbc_read(table: str) -> DataFrame:
     )
 
 
-def table_exists(full_name: str) -> bool:
-    try:
-        spark.table(full_name).limit(0).collect()
-        return True
-    except AnalysisException:
-        return False
+def jdbc_write_postgres(df: DataFrame, schema: str, table: str, mode: str = "overwrite") -> None:
+    """Write DataFrame to PostgreSQL using JDBC"""
+    table_name = f"{schema}.{table}"
+    properties = {
+        "url": pg_url,
+        "driver": "org.postgresql.Driver",
+        "dbtable": table_name,
+        "user": pg_user,
+        "password": pg_password,
+    }
+    df.write.format("jdbc").mode(mode).options(**properties).save()
 
-
-def with_sync_metadata(df: DataFrame) -> DataFrame:
-    hash_columns = [coalesce(col(c).cast("string"), lit("__NULL__")) for c in df.columns]
-    return (
-        df.withColumn("_row_hash", sha2(concat_ws("||", *hash_columns), 256))
-        .withColumn("_is_deleted", lit(False))
-        .withColumn("_synced_at", current_timestamp())
-    )
-
-
-def pk_join(left_alias: str, right_alias: str, primary_keys: List[str]) -> str:
-    return " AND ".join(
-        f"{left_alias}.{q(pk)} = {right_alias}.{q(pk)}" for pk in primary_keys
-    )
-
-
-def sync_bronze_table(table: str, primary_keys: List[str]) -> None:
-    target = table_name(bronze_namespace, table)
-    stage_view = f"stage_{table}"
-    source_df = with_sync_metadata(jdbc_read(table))
-    source_df.createOrReplaceTempView(stage_view)
-
-    if not table_exists(target):
-        (
-            source_df.writeTo(target)
-            .using("iceberg")
-            .tableProperty("format-version", "2")
-            .create()
-        )
-        print(f"  created {target}")
-        return
-
-    all_columns = source_df.columns
-    update_assignments = ",\n          ".join(
-        f"{q(column)} = s.{q(column)}" for column in all_columns
-    )
-    insert_columns = ", ".join(q(column) for column in all_columns)
-    insert_values = ", ".join(f"s.{q(column)}" for column in all_columns)
-
-    spark.sql(
-        f"""
-        MERGE INTO {target} t
-        USING {stage_view} s
-        ON {pk_join("t", "s", primary_keys)}
-        WHEN MATCHED AND (t._is_deleted = true OR t._row_hash <> s._row_hash)
-          THEN UPDATE SET
-          {update_assignments}
-        WHEN NOT MATCHED
-          THEN INSERT ({insert_columns})
-          VALUES ({insert_values})
-        """
-    )
-
-    key_columns = ", ".join(f"t.{q(pk)}" for pk in primary_keys)
-    spark.sql(
-        f"""
-        MERGE INTO {target} t
-        USING (
-          SELECT {key_columns}
-          FROM {target} t
-          LEFT ANTI JOIN {stage_view} s
-          ON {pk_join("t", "s", primary_keys)}
-          WHERE t._is_deleted = false
-        ) d
-        ON {pk_join("t", "d", primary_keys)}
-        WHEN MATCHED THEN UPDATE SET
-          _is_deleted = true,
-          _synced_at = current_timestamp()
-        """
-    )
-    print(f"  synced {target}")
-
-
-def replace_table_from_query(table: str, query: str, partition_clause: str = "") -> None:
-    spark.sql(
-        f"""
-        CREATE OR REPLACE TABLE {table}
-        USING iceberg
-        {partition_clause}
-        TBLPROPERTIES ('format-version' = '2')
-        AS
-        {query}
-        """
-    )
 
 
 def key_expr(column: str) -> str:
-    return (
-        f"CAST(pmod(xxhash64(CAST({column} AS STRING)), "
-        "9223372036854775807) AS BIGINT)"
-    )
+    """Generate a hash-based key expression"""
+    return f"abs(hash({column}))"
 
 
 def nullable_key_expr(column: str) -> str:
+    """Generate a nullable hash-based key expression"""
     return f"CASE WHEN {column} IS NULL THEN NULL ELSE {key_expr(column)} END"
 
 
-create_namespace(bronze_namespace)
-create_namespace(star_namespace)
+# Create schema if it doesn't exist
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS star_schema")
 
-print("Syncing classicmodels source tables into Iceberg bronze...")
-for source_table, primary_key in SOURCE_TABLES.items():
-    sync_bronze_table(source_table, primary_key)
+# Read all source tables from MySQL
+print("Reading classicmodels source tables from MySQL...")
+source_data = {}
+for source_table in SOURCE_TABLES.keys():
+    source_data[source_table] = jdbc_read_mysql(source_table)
+    print(f"  loaded {source_table}: {source_data[source_table].count()} rows")
 
-offices = table_name(bronze_namespace, "offices")
-employees = table_name(bronze_namespace, "employees")
-customers = table_name(bronze_namespace, "customers")
-productlines = table_name(bronze_namespace, "productlines")
-products = table_name(bronze_namespace, "products")
-orders = table_name(bronze_namespace, "orders")
-orderdetails = table_name(bronze_namespace, "orderdetails")
-payments = table_name(bronze_namespace, "payments")
+# Create temporary views for easier querying
+for table_name, df in source_data.items():
+    df.createOrReplaceTempView(table_name)
 
-print("Building classicmodels star schema...")
-replace_table_from_query(
-    table_name(star_namespace, "dim_customer"),
-    f"""
+# Build dimensions
+print("Building star schema dimensions...")
+
+# Dimension: dim_customer
+dim_customer = spark.sql("""
     SELECT
-      {key_expr("c.customerNumber")} AS customer_key,
-      c.customerNumber AS customer_number,
-      c.customerName AS customer_name,
-      c.contactFirstName AS contact_first_name,
-      c.contactLastName AS contact_last_name,
+      abs(hash(c.customerNumber)) AS customer_key,
+      c.customerNumber,
+      c.customerName,
+      c.contactFirstName,
+      c.contactLastName,
       c.phone,
-      c.addressLine1 AS address_line_1,
-      c.addressLine2 AS address_line_2,
+      c.addressLine1,
+      c.addressLine2,
       c.city,
       c.state,
-      c.postalCode AS postal_code,
+      c.postalCode,
       c.country,
-      {nullable_key_expr("c.salesRepEmployeeNumber")} AS sales_rep_employee_key,
-      c.salesRepEmployeeNumber AS sales_rep_employee_number,
-      CAST(c.creditLimit AS DECIMAL(12, 2)) AS credit_limit,
+      CAST(CASE WHEN c.salesRepEmployeeNumber IS NULL THEN NULL ELSE abs(hash(c.salesRepEmployeeNumber)) END AS BIGINT) AS sales_rep_employee_key,
+      c.salesRepEmployeeNumber,
+      CAST(c.creditLimit AS DECIMAL(12, 2)) AS creditLimit,
       current_timestamp() AS etl_loaded_at
-    FROM {customers} c
-    WHERE c._is_deleted = false
-    """,
-)
+    FROM customers c
+""")
+jdbc_write_postgres(dim_customer, "star_schema", "dim_customer", "overwrite")
+print(f"  created dim_customer: {dim_customer.count()} rows")
 
-replace_table_from_query(
-    table_name(star_namespace, "dim_product"),
-    f"""
+# Dimension: dim_product
+dim_product = spark.sql("""
     SELECT
-      {key_expr("p.productCode")} AS product_key,
-      p.productCode AS product_code,
-      p.productName AS product_name,
-      p.productLine AS product_line,
-      pl.textDescription AS product_line_description,
-      p.productScale AS product_scale,
-      p.productVendor AS product_vendor,
-      p.productDescription AS product_description,
-      CAST(p.quantityInStock AS INT) AS quantity_in_stock,
-      CAST(p.buyPrice AS DECIMAL(10, 2)) AS buy_price,
+      abs(hash(p.productCode)) AS product_key,
+      p.productCode,
+      p.productName,
+      p.productLine,
+      pl.textDescription AS productLineDescription,
+      p.productScale,
+      p.productVendor,
+      p.productDescription,
+      CAST(p.quantityInStock AS INT) AS quantityInStock,
+      CAST(p.buyPrice AS DECIMAL(10, 2)) AS buyPrice,
       CAST(p.MSRP AS DECIMAL(10, 2)) AS msrp,
       current_timestamp() AS etl_loaded_at
-    FROM {products} p
-    LEFT JOIN {productlines} pl
+    FROM products p
+    LEFT JOIN productlines pl
       ON p.productLine = pl.productLine
-      AND pl._is_deleted = false
-    WHERE p._is_deleted = false
-    """,
-)
+""")
+jdbc_write_postgres(dim_product, "star_schema", "dim_product", "overwrite")
+print(f"  created dim_product: {dim_product.count()} rows")
 
-replace_table_from_query(
-    table_name(star_namespace, "dim_employee"),
-    f"""
+# Dimension: dim_employee
+dim_employee = spark.sql("""
     SELECT
-      {key_expr("e.employeeNumber")} AS employee_key,
-      e.employeeNumber AS employee_number,
-      e.firstName AS first_name,
-      e.lastName AS last_name,
-      concat(e.firstName, ' ', e.lastName) AS full_name,
+      abs(hash(e.employeeNumber)) AS employee_key,
+      e.employeeNumber,
+      e.firstName,
+      e.lastName,
+      concat(e.firstName, ' ', e.lastName) AS fullName,
       e.extension,
       e.email,
-      e.jobTitle AS job_title,
-      {nullable_key_expr("e.reportsTo")} AS manager_employee_key,
-      e.reportsTo AS manager_employee_number,
-      {key_expr("e.officeCode")} AS office_key,
-      e.officeCode AS office_code,
+      e.jobTitle,
+      CAST(CASE WHEN e.reportsTo IS NULL THEN NULL ELSE abs(hash(e.reportsTo)) END AS BIGINT) AS manager_employee_key,
+      e.reportsTo,
+      abs(hash(e.officeCode)) AS office_key,
+      e.officeCode,
       current_timestamp() AS etl_loaded_at
-    FROM {employees} e
-    WHERE e._is_deleted = false
-    """,
-)
+    FROM employees e
+""")
+jdbc_write_postgres(dim_employee, "star_schema", "dim_employee", "overwrite")
+print(f"  created dim_employee: {dim_employee.count()} rows")
 
-replace_table_from_query(
-    table_name(star_namespace, "dim_office"),
-    f"""
+# Dimension: dim_office
+dim_office = spark.sql("""
     SELECT
-      {key_expr("o.officeCode")} AS office_key,
-      o.officeCode AS office_code,
+      abs(hash(o.officeCode)) AS office_key,
+      o.officeCode,
       o.city,
       o.phone,
-      o.addressLine1 AS address_line_1,
-      o.addressLine2 AS address_line_2,
+      o.addressLine1,
+      o.addressLine2,
       o.state,
       o.country,
-      o.postalCode AS postal_code,
+      o.postalCode,
       o.territory,
       current_timestamp() AS etl_loaded_at
-    FROM {offices} o
-    WHERE o._is_deleted = false
-    """,
-)
+    FROM offices o
+""")
+jdbc_write_postgres(dim_office, "star_schema", "dim_office", "overwrite")
+print(f"  created dim_office: {dim_office.count()} rows")
 
-replace_table_from_query(
-    table_name(star_namespace, "dim_date"),
-    f"""
+# Dimension: dim_date
+dim_date = spark.sql("""
     WITH all_dates AS (
-      SELECT orderDate AS calendar_date FROM {orders}
-      WHERE _is_deleted = false
+      SELECT orderDate AS calendar_date FROM orders
       UNION ALL
-      SELECT requiredDate AS calendar_date FROM {orders}
-      WHERE _is_deleted = false
+      SELECT requiredDate AS calendar_date FROM orders
       UNION ALL
-      SELECT shippedDate AS calendar_date FROM {orders}
-      WHERE _is_deleted = false AND shippedDate IS NOT NULL
+      SELECT shippedDate AS calendar_date FROM orders WHERE shippedDate IS NOT NULL
       UNION ALL
-      SELECT paymentDate AS calendar_date FROM {payments}
-      WHERE _is_deleted = false
+      SELECT paymentDate AS calendar_date FROM payments
     ),
     bounds AS (
       SELECT min(calendar_date) AS min_date, max(calendar_date) AS max_date
@@ -324,29 +217,32 @@ replace_table_from_query(
       date_format(calendar_date, 'EEEE') AS day_name,
       CASE WHEN dayofweek(calendar_date) IN (1, 7) THEN true ELSE false END AS is_weekend
     FROM dates
-    """,
-)
+""")
+jdbc_write_postgres(dim_date, "star_schema", "dim_date", "overwrite")
+print(f"  created dim_date: {dim_date.count()} rows")
 
-replace_table_from_query(
-    table_name(star_namespace, "fact_order_sales"),
-    f"""
+# Build facts
+print("Building star schema facts...")
+
+# Fact: fact_order_sales
+fact_order_sales = spark.sql("""
     SELECT
       concat(CAST(od.orderNumber AS STRING), '-', od.productCode) AS sales_line_id,
-      od.orderNumber AS order_number,
-      od.orderLineNumber AS order_line_number,
-      {key_expr("o.customerNumber")} AS customer_key,
-      {key_expr("od.productCode")} AS product_key,
-      {nullable_key_expr("c.salesRepEmployeeNumber")} AS sales_rep_employee_key,
-      {nullable_key_expr("e.officeCode")} AS sales_office_key,
+      od.orderNumber,
+      od.orderLineNumber,
+      abs(hash(o.customerNumber)) AS customer_key,
+      abs(hash(od.productCode)) AS product_key,
+      CAST(CASE WHEN c.salesRepEmployeeNumber IS NULL THEN NULL ELSE abs(hash(c.salesRepEmployeeNumber)) END AS BIGINT) AS sales_rep_employee_key,
+      CAST(CASE WHEN e.officeCode IS NULL THEN NULL ELSE abs(hash(e.officeCode)) END AS BIGINT) AS sales_office_key,
       CAST(date_format(o.orderDate, 'yyyyMMdd') AS INT) AS order_date_key,
       CAST(date_format(o.requiredDate, 'yyyyMMdd') AS INT) AS required_date_key,
       CASE
         WHEN o.shippedDate IS NULL THEN NULL
         ELSE CAST(date_format(o.shippedDate, 'yyyyMMdd') AS INT)
       END AS shipped_date_key,
-      o.orderDate AS order_date,
-      o.requiredDate AS required_date,
-      o.shippedDate AS shipped_date,
+      o.orderDate,
+      o.requiredDate,
+      o.shippedDate,
       o.status AS order_status,
       CAST(od.quantityOrdered AS INT) AS quantity_ordered,
       CAST(od.priceEach AS DECIMAL(10, 2)) AS price_each,
@@ -356,49 +252,41 @@ replace_table_from_query(
       CAST(od.quantityOrdered * p.buyPrice AS DECIMAL(12, 2)) AS cost_amount,
       CAST(od.quantityOrdered * (od.priceEach - p.buyPrice) AS DECIMAL(12, 2)) AS margin_amount,
       current_timestamp() AS etl_loaded_at
-    FROM {orderdetails} od
-    JOIN {orders} o
+    FROM orderdetails od
+    JOIN orders o
       ON od.orderNumber = o.orderNumber
-      AND o._is_deleted = false
-    JOIN {customers} c
+    JOIN customers c
       ON o.customerNumber = c.customerNumber
-      AND c._is_deleted = false
-    JOIN {products} p
+    JOIN products p
       ON od.productCode = p.productCode
-      AND p._is_deleted = false
-    LEFT JOIN {employees} e
+    LEFT JOIN employees e
       ON c.salesRepEmployeeNumber = e.employeeNumber
-      AND e._is_deleted = false
-    WHERE od._is_deleted = false
-      AND o.status <> 'Cancelled'
-    """,
-    "PARTITIONED BY (days(order_date))",
-)
+    WHERE o.status <> 'Cancelled'
+""")
+jdbc_write_postgres(fact_order_sales, "star_schema", "fact_order_sales", "overwrite")
+print(f"  created fact_order_sales: {fact_order_sales.count()} rows")
 
-replace_table_from_query(
-    table_name(star_namespace, "fact_payments"),
-    f"""
+# Fact: fact_payments
+fact_payments = spark.sql("""
     SELECT
       concat(CAST(p.customerNumber AS STRING), '-', p.checkNumber) AS payment_id,
-      p.customerNumber AS customer_number,
-      p.checkNumber AS check_number,
-      {key_expr("p.customerNumber")} AS customer_key,
-      {nullable_key_expr("c.salesRepEmployeeNumber")} AS sales_rep_employee_key,
+      p.customerNumber,
+      p.checkNumber,
+      abs(hash(p.customerNumber)) AS customer_key,
+      CAST(CASE WHEN c.salesRepEmployeeNumber IS NULL THEN NULL ELSE abs(hash(c.salesRepEmployeeNumber)) END AS BIGINT) AS sales_rep_employee_key,
       CAST(date_format(p.paymentDate, 'yyyyMMdd') AS INT) AS payment_date_key,
-      p.paymentDate AS payment_date,
+      p.paymentDate,
       CAST(p.amount AS DECIMAL(12, 2)) AS payment_amount,
       current_timestamp() AS etl_loaded_at
-    FROM {payments} p
-    JOIN {customers} c
+    FROM payments p
+    JOIN customers c
       ON p.customerNumber = c.customerNumber
-      AND c._is_deleted = false
-    WHERE p._is_deleted = false
-    """,
-    "PARTITIONED BY (days(payment_date))",
-)
+""")
+jdbc_write_postgres(fact_payments, "star_schema", "fact_payments", "overwrite")
+print(f"  created fact_payments: {fact_payments.count()} rows")
 
-print("Pipeline complete. Star schema tables:")
-for star_table in [
+print("Pipeline complete. Star schema tables built in PostgreSQL:")
+for table in [
     "dim_customer",
     "dim_product",
     "dim_employee",
@@ -407,8 +295,11 @@ for star_table in [
     "fact_order_sales",
     "fact_payments",
 ]:
-    full_name = table_name(star_namespace, star_table)
-    count = spark.table(full_name).count()
-    print(f"  {full_name}: {count} rows")
+    try:
+        count = spark.sql(f"SELECT COUNT(*) FROM star_schema.{table}").collect()[0][0]
+        print(f"  star_schema.{table}: {count} rows")
+    except Exception as e:
+        print(f"  star_schema.{table}: error - {e}")
 
 spark.stop()
+
